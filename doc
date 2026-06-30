@@ -1,0 +1,1004 @@
+# VastraCo — Complete Project Documentation
+
+VastraCo is a cloud-native fashion e-commerce platform built as a microservices application. It includes an AI-powered shopping assistant, a full GitOps CI/CD pipeline, and production infrastructure deployed on AWS EKS using Terraform, Helm, and ArgoCD.
+
+---
+
+## Table of Contents
+
+1. [Repository Layout](#1-repository-layout)
+2. [Architecture](#2-architecture)
+3. [Application Services](#3-application-services)
+4. [API Reference](#4-api-reference)
+5. [Infrastructure (Terraform)](#5-infrastructure-terraform)
+6. [Kubernetes & Helm](#6-kubernetes--helm)
+7. [CI/CD Pipeline](#7-cicd-pipeline)
+8. [Security](#8-security)
+9. [Local Development](#9-local-development)
+10. [Production Deployment](#10-production-deployment)
+11. [Environment Variables Reference](#11-environment-variables-reference)
+
+---
+
+## 1. Repository Layout
+
+The project is split across three GitHub repositories under the `VastraCo-AWS` organization:
+
+| Repository | Purpose |
+|---|---|
+| `VastraCo-AWS/vastraCo-app` | Application source code — all five microservices and the CI workflow |
+| `VastraCo-AWS/vastraCo-helm` | Helm chart, ArgoCD Application/AppProject manifests, kgateway routing |
+| `VastraCo-AWS/vastraCo-terraform` | Terraform modules for all AWS infrastructure |
+
+### vastraCo-app structure
+
+```
+vastraCo-app/
+├── .github/
+│   └── workflows/
+│       ├── ci.yml          # Build, scan, and push all services
+│       └── cd.yml          # GitOps Helm update + ArgoCD sync verification
+├── frontend/               # React + Vite SPA (port 80 in container)
+├── user-service/           # Node.js auth service (port 3001)
+├── product-service/        # Node.js product catalog (port 3002)
+├── order-service/          # Node.js order management (port 3003)
+├── ai-service/             # Python FastAPI + LangGraph agent (port 3004)
+├── docker-compose.yml      # Local development stack
+├── .env.example            # Environment variable template
+└── README.md
+```
+
+### vastraCo-helm structure
+
+```
+vastraCo-helm/
+├── argocd/
+│   ├── application-production.yaml   # ArgoCD Application (auto-sync, self-heal)
+│   ├── application-kgateway.yaml     # Gateway API route application
+│   └── appproject.yaml               # ArgoCD AppProject with RBAC
+├── charts/
+│   └── vastraco-services/
+│       ├── Chart.yaml
+│       ├── values.yaml               # Default values for all services
+│       ├── values-production.yaml    # Production overrides (image tags, IRSA ARNs)
+│       └── templates/
+│           ├── _helpers.tpl
+│           ├── configmap.yaml
+│           ├── deployment.yaml       # Single template iterating all services
+│           ├── hpa.yaml
+│           ├── namespace.yaml
+│           ├── networkpolicy.yaml
+│           ├── secretproviderclass.yaml
+│           ├── service.yaml
+│           └── serviceaccount.yaml
+├── jobs/
+│   └── db-creation-job.yaml
+└── kgateway/
+    ├── gateway.yaml
+    └── httproute.yaml
+```
+
+### vastraCo-terraform structure
+
+```
+vastraCo-terraform/
+├── bootstrap/              # One-time state bucket and OIDC setup
+├── scripts/
+│   ├── setup-aws-oidc.sh   # Wire up GitHub OIDC with AWS
+│   └── setup-github.sh     # Set GitHub secrets/vars for CI
+└── terraform/
+    ├── main.tf             # Root module — composes all sub-modules
+    ├── variables.tf
+    ├── outputs.tf
+    ├── providers.tf
+    ├── versions.tf
+    ├── locals.tf
+    ├── terraform.tfvars
+    └── modules/
+        ├── vpc/            # VPC, subnets, NAT gateways, route tables
+        ├── eks/            # EKS cluster, managed node group, OIDC
+        ├── rds/            # PostgreSQL 16, subnet group, security group
+        ├── kms/            # Customer Managed Key for all encryption
+        ├── secretsmanager/ # db-creds, jwt-secret, app-secrets secrets
+        ├── irsa/           # OIDC provider + per-service IAM roles
+        ├── iam/            # EKS cluster role, node role
+        ├── s3/             # Product images bucket with OAC
+        ├── alb/            # Application Load Balancer (HTTPS termination)
+        ├── cloudfront/     # CDN distribution (WAF-protected)
+        ├── waf/            # WAF v2 WebACL with AWS managed rule sets
+        ├── route53/        # DNS (vastraco.online)
+        └── monitoring/     # CloudWatch log groups, alarms, SNS alerts
+```
+
+---
+
+## 2. Architecture
+
+### Production Architecture (AWS EKS)
+
+```
+                        Internet
+                           │
+                    ┌──────▼──────┐
+                    │  Route 53   │  vastraco.online
+                    │  (DNS)      │
+                    └──────┬──────┘
+                           │
+                    ┌──────▼──────┐
+                    │  CloudFront │  CDN + WAF (AWS Managed Rules)
+                    │  + WAF      │  PriceClass_100, IPv6 enabled
+                    └──────┬──────┘
+                    /api/* │         /images/*        SPA static
+                    │      │              │
+             ┌──────▼──┐  ┌──────────────▼──────┐
+             │   ALB   │  │  S3 (Product Images) │
+             │ (HTTPS) │  │  + CloudFront OAC    │
+             └──────┬──┘  └─────────────────────-┘
+                    │
+          ┌─────────▼──────────────────────────────────┐
+          │              AWS EKS (us-east-1)            │
+          │         Kubernetes 1.29 — t3.medium x2-3    │
+          │                                             │
+          │  namespace: production                      │
+          │                                             │
+          │  ┌─────────────┐  ┌───────────────────┐   │
+          │  │  frontend   │  │   user-service     │   │
+          │  │  (2 pods)   │  │   (2 pods)         │   │
+          │  │  nginx:80   │  │   Node.js :3001    │   │
+          │  └─────────────┘  └─────────┬─────────┘   │
+          │                             │IRSA           │
+          │  ┌─────────────┐  ┌─────────▼─────────┐   │
+          │  │product-svc  │  │  order-service     │   │
+          │  │  (2 pods)   │  │  (2 pods)          │   │
+          │  │  Node.js    │  │  Node.js :3003     │   │
+          │  │  :3002      │  └────────────────────┘   │
+          │  └─────────────┘                           │
+          │                                             │
+          │  ┌──────────────────────────────────────┐  │
+          │  │        ai-service  (1 pod)           │  │
+          │  │  FastAPI + LangGraph + Groq :3004    │  │
+          │  └──────────────────────────────────────┘  │
+          └──────────────┬──────────────────────────────┘
+                         │
+          ┌──────────────▼──────────────────────────────┐
+          │              AWS Managed Services            │
+          │                                             │
+          │  ┌──────────────────┐  ┌────────────────┐  │
+          │  │  RDS PostgreSQL  │  │ Secrets Manager │  │
+          │  │  16 (private     │  │ vastraco/db-creds│ │
+          │  │  subnet)         │  │ vastraco/jwt-   │  │
+          │  │  Single instance │  │   secret        │  │
+          │  └──────────────────┘  │ vastraco/app-   │  │
+          │                        │   secrets       │  │
+          │  ┌──────────────────┐  └────────┬────────┘  │
+          │  │    AWS KMS       │           │            │
+          │  │ Customer Managed │◄──────────┘ encrypts  │
+          │  │ Key (CMK)        │                        │
+          │  └──────────────────┘                        │
+          │                                              │
+          │  ┌───────────────────────────────────────┐  │
+          │  │ CloudWatch: Log Groups + Alarms + SNS │  │
+          │  └───────────────────────────────────────┘  │
+          └──────────────────────────────────────────────┘
+```
+
+### Network Layout
+
+| Subnet Tier | CIDR | Hosts |
+|---|---|---|
+| Public (2 AZs) | 10.0.1.0/24, 10.0.2.0/24 | ALB, NAT Gateways |
+| Private App (2 AZs) | 10.0.10.0/24, 10.0.11.0/24 | EKS worker nodes |
+| Private DB (2 AZs) | 10.0.20.0/24, 10.0.21.0/24 | RDS PostgreSQL |
+
+### Local Development Architecture (Docker Compose)
+
+```
+Browser :3000
+      │
+      ▼
+frontend (nginx :80)
+      │
+      ├──► user-service    :3001 ──► users-db    (postgres:15)
+      ├──► product-service :3002 ──► products-db (postgres:15)
+      ├──► order-service   :3003 ──► orders-db   (postgres:15)
+      └──► ai-service      :3004 ──► product-service / order-service
+```
+
+All containers share the `vastraco-network` bridge. The frontend container proxies API calls to backend services by hostname (e.g. `http://user-service:3001`).
+
+---
+
+## 3. Application Services
+
+### 3.1 Frontend
+
+| Item | Detail |
+|---|---|
+| Technology | React 18 + Vite, Tailwind CSS |
+| Container | nginx:alpine, port 80 |
+| ECR image | `078426574503.dkr.ecr.us-east-1.amazonaws.com/frontend-service` |
+| Replicas (prod) | 2 (HPA: 2–5, CPU 70%) |
+| Resources | req: 100m/128Mi, limit: 200m/256Mi |
+
+**Pages:**
+- `/` — Home / landing
+- `/products` — Product catalog with filters
+- `/products/:id` — Product detail
+- `/login`, `/register` — Authentication
+- `/checkout` — Checkout flow
+- `/orders` — Order history
+
+**Components of note:**
+- `AIAssistant.jsx` — Floating chat widget that calls `POST /api/ai/chat`. Passes the JWT cookie automatically; the AI service uses it to unlock order-query tools for authenticated users.
+- `AuthContext.jsx` — JWT stored in an HTTP-only cookie; React context reads the user from `GET /api/auth/me` on mount.
+- `CartContext.jsx` — Client-side cart state (not persisted to a service).
+- `axios.js` — Axios instance with `withCredentials: true` and `VITE_API_BASE_URL` base URL.
+
+### 3.2 User Service
+
+| Item | Detail |
+|---|---|
+| Technology | Node.js 20, Express, pg, bcrypt, jsonwebtoken |
+| Port | 3001 |
+| Database | `users_db` (PostgreSQL) |
+| ECR image | `078426574503.dkr.ecr.us-east-1.amazonaws.com/user-service` |
+| Replicas (prod) | 2 (HPA: 2–5, CPU 70%) |
+| Resources | req: 100m/128Mi, limit: 300m/256Mi |
+| IRSA role | `vastraco-production-irsa-user-service` |
+
+**Middleware:** `helmet`, `cors`, `morgan`, `cookie-parser`
+
+JWT tokens are signed with `JWT_SECRET` from AWS Secrets Manager and set as HTTP-only cookies with a 7-day expiry. The `secure` flag is enabled in production mode.
+
+### 3.3 Product Service
+
+| Item | Detail |
+|---|---|
+| Technology | Node.js 20, Express, pg |
+| Port | 3002 |
+| Database | `products_db` (PostgreSQL) |
+| ECR image | `078426574503.dkr.ecr.us-east-1.amazonaws.com/product-service` |
+| Replicas (prod) | 2 (HPA: 2–5, CPU 70%) |
+| Resources | req: 100m/128Mi, limit: 300m/256Mi |
+| IRSA role | `vastraco-production-irsa-product-service` |
+
+Product images are served from S3 via CloudFront (`/images/*` cache behavior). The product catalog supports filtering by category, gender, occasion, material, color, price range, search text, and sort order.
+
+### 3.4 Order Service
+
+| Item | Detail |
+|---|---|
+| Technology | Node.js 20, Express, pg |
+| Port | 3003 |
+| Database | `orders_db` (PostgreSQL) |
+| ECR image | `078426574503.dkr.ecr.us-east-1.amazonaws.com/order-service` |
+| Replicas (prod) | 2 (HPA: 2–5, CPU 70%) |
+| Resources | req: 100m/128Mi, limit: 300m/256Mi |
+| IRSA role | `vastraco-production-irsa-order-service` |
+
+When an order is placed, the order service calls the product service's internal stock-management endpoints (`PUT /api/products/variant/:id/stock`) within the cluster network to decrement inventory. On cancellation, stock is restored via the corresponding restore endpoint.
+
+### 3.5 AI Service
+
+| Item | Detail |
+|---|---|
+| Technology | Python 3.12, FastAPI, LangGraph, LangChain, Groq |
+| Port | 3004 |
+| ECR image | `078426574503.dkr.ecr.us-east-1.amazonaws.com/ai-service` |
+| Replicas (prod) | 1 (HPA: 1–3, CPU 70%) |
+| Resources | req: 200m/512Mi, limit: 500m/1Gi |
+| IRSA role | `vastraco-production-irsa-ai-service` |
+| LLM | Groq — `llama-3.3-70b-versatile` (131k context) |
+
+**Agent Design (LangGraph ReAct):**
+
+The agent is implemented as a LangGraph ReAct graph using `create_react_agent`. Conversation memory is held in a `MemorySaver` keyed by `session_id`, surviving across multiple turns in the same session (cleared on pod restart).
+
+Tools are created per-request as closures that capture the product/order service URLs and the user's JWT. This allows the tool set to be extended with order-query tools when the caller is authenticated:
+
+| Tool | Auth Required | Description |
+|---|---|---|
+| `search_products` | No | Search catalog by keyword, category, price, gender, occasion, material, color |
+| `get_categories` | No | Fetch all product categories |
+| `get_return_policy` | No | Return VastraCo's return/refund/exchange policy |
+| `get_user_orders` | Yes (JWT) | Fetch authenticated user's order history |
+| `get_order_by_id` | Yes (JWT) | Fetch a specific order by UUID |
+
+At startup, the lifespan handler validates Groq connectivity. If validation fails, the service marks itself `degraded` via `/api/ai/health` and returns 503 on chat requests (container stays alive for log access).
+
+JWT extraction: the route handler reads the token from the `token` HTTP-only cookie or `Authorization: Bearer` header, verifies the signature with `JWT_SECRET`, and passes the raw token to tools that forward it to the order service.
+
+---
+
+## 4. API Reference
+
+### User Service (`/api/auth`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/auth/register` | None | Register a new user. Returns user object + JWT cookie |
+| POST | `/api/auth/login` | None | Login. Returns user object + JWT cookie |
+| POST | `/api/auth/logout` | None | Clears the JWT cookie |
+| GET | `/api/auth/me` | JWT | Return the current user's profile |
+| PUT | `/api/auth/me` | JWT | Update the current user's display name |
+| GET | `/health` | None | Liveness probe — returns `{status, service, timestamp, uptime}` |
+| GET | `/ready` | None | Readiness probe — runs `SELECT 1` against the DB |
+
+### Product Service (`/api`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/categories` | None | List all product categories |
+| GET | `/api/products` | None | List products (supports `search`, `category`, `min_price`, `max_price`, `gender`, `occasion`, `material`, `color`, `sort`, `limit`, `offset`) |
+| GET | `/api/products/:id` | None | Get product detail by ID |
+| POST | `/api/products` | JWT + Admin | Create a product |
+| PUT | `/api/products/:id` | JWT + Admin | Update a product |
+| DELETE | `/api/products/:id` | JWT + Admin | Delete a product |
+| PUT | `/api/products/variant/:id/stock` | Internal | Decrement stock (called by order-service) |
+| PUT | `/api/products/variant/:id/stock/restore` | Internal | Restore stock on order cancellation |
+| GET | `/health` | None | Liveness probe |
+| GET | `/ready` | None | Readiness probe |
+
+### Order Service (`/api/orders`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/orders` | JWT | Place a new order |
+| GET | `/api/orders` | JWT | Get all orders for the authenticated user |
+| GET | `/api/orders/:id` | JWT | Get a specific order by ID |
+| PUT | `/api/orders/:id/cancel` | JWT | Cancel a pending order |
+| GET | `/health` | None | Liveness probe |
+| GET | `/ready` | None | Readiness probe |
+
+### AI Service (`/api/ai`)
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/api/ai/chat` | Optional JWT | Send a message to the AI assistant. Body: `{message, session_id}`. Returns `{response, products[], session_id, authenticated}` |
+| GET | `/api/ai/health` | None | Liveness probe — includes Groq connectivity status |
+| GET | `/api/ai/ready` | None | Readiness probe — returns 503 if Groq is unavailable |
+
+---
+
+## 5. Infrastructure (Terraform)
+
+All infrastructure is defined in `VastraCo-AWS/vastraCo-terraform`. The root module (`terraform/main.tf`) composes twelve sub-modules.
+
+### Module Dependency Graph
+
+```
+kms ──────────────────────────────────────────────────────────────────────────►┐
+vpc ──────────────────────────────────────────────────────────────────────────►│
+iam ──────────────────────────────────────────────────────────────────────────►│
+                                                                               ▼
+                                                                            eks ──► irsa
+                                                                             │
+                                                            rds (private DB) │
+                                                            s3  (images)  ───┘
+                                                                 │
+                                               secretsmanager (uses kms + rds outputs)
+                                                                 │
+                                    alb ── cloudfront ── waf ───┘
+                                    route53 (alb + cloudfront)
+                                    monitoring (eks + rds + kms)
+```
+
+### 5.1 VPC (`modules/vpc`)
+
+- **CIDR:** `10.0.0.0/16`
+- **Public subnets:** `10.0.1.0/24`, `10.0.2.0/24` (2 AZs) — host ALB and NAT Gateways. Tagged `kubernetes.io/role/elb=1`.
+- **Private app subnets:** `10.0.10.0/24`, `10.0.11.0/24` — host EKS worker nodes. Tagged `kubernetes.io/role/internal-elb=1`.
+- **Private DB subnets:** `10.0.20.0/24`, `10.0.21.0/24` — host RDS, no internet access.
+- Two NAT Gateways (one per AZ) allow private subnets to reach the internet for ECR pulls, AWS API calls, and Groq API.
+- DNS hostnames and DNS support enabled on the VPC.
+
+### 5.2 EKS (`modules/eks`)
+
+| Setting | Value |
+|---|---|
+| Kubernetes version | 1.29 |
+| Node instance type | t3.medium |
+| Desired nodes | 2 |
+| Min / Max nodes | 1 / 3 |
+| Node location | Private app subnets |
+| Secrets encryption | KMS CMK applied to Kubernetes secrets at rest |
+| OIDC | OIDC issuer URL exported for IRSA |
+
+Control plane logs (API server, audit, authenticator) are sent to CloudWatch. Nodes run in a managed node group with an auto-scaling policy. The EKS cluster security group restricts inbound access; the node security group allows node-to-node communication, control-plane-to-node traffic (ports 1025–65535), and ALB health check traffic (80/443 from within the VPC).
+
+### 5.3 RDS (`modules/rds`)
+
+| Setting | Value |
+|---|---|
+| Engine | PostgreSQL 16 |
+| Instance class | Configurable (`db.t3.micro` default) |
+| Storage | 20 GB gp2, encrypted with KMS CMK |
+| Multi-AZ | Configurable |
+| Subnet group | Private DB subnets |
+| Security group | Port 5432 only from EKS node SG |
+| Password | Generated by `random_password`, stored in Secrets Manager |
+| Parameter group | `log_connections=1`, `log_disconnections=1` |
+
+A single RDS instance hosts the shared PostgreSQL server. The three service databases (`users_db`, `products_db`, `orders_db`) are created by the `jobs/db-creation-job.yaml` Kubernetes Job after initial deployment.
+
+### 5.4 KMS (`modules/kms`)
+
+A single Customer Managed Key (CMK) encrypts:
+- RDS storage
+- EKS Kubernetes secrets
+- S3 product images bucket (SSE-KMS)
+- Secrets Manager secrets
+- CloudWatch log groups
+- SNS topic
+
+Key rotation is enabled. All modules receive the `kms_key_arn` output from the KMS module.
+
+### 5.5 Secrets Manager (`modules/secretsmanager`)
+
+Three secrets are created, all encrypted with the KMS CMK:
+
+| Secret Name | Contents | Recovery Window |
+|---|---|---|
+| `vastraco/db-creds` | `{host, port, dbname, username, password}` | 7 days |
+| `vastraco/jwt-secret` | `{jwt_secret}` — 64-char random string | 7 days |
+| `vastraco/app-secrets` | General application secrets (Groq API key, etc.) | 7 days |
+
+Pods access these via the **AWS Secrets Store CSI Driver** with `SecretProviderClass` objects mounted as volumes. Environment variables are synced from the mounted secret files by the CSI driver's secret sync feature.
+
+### 5.6 IRSA (`modules/irsa`)
+
+IRSA (IAM Roles for Service Accounts) grants individual pods least-privilege access to AWS services without static credentials. The module:
+
+1. Creates an OIDC Identity Provider from the EKS cluster's OIDC issuer URL.
+2. Creates one IAM role per service with a trust policy that restricts assumption to the matching Kubernetes ServiceAccount in the `production` namespace.
+3. Attaches inline policies to each role.
+
+| Service Account | IAM Role | Permissions |
+|---|---|---|
+| `user-service-sa` | `vastraco-production-irsa-user-service` | Secrets Manager read (`vastraco/*`), KMS decrypt |
+| `product-service-sa` | `vastraco-production-irsa-product-service` | Secrets Manager read, KMS decrypt, S3 read (`vastraco-product-images`) |
+| `order-service-sa` | `vastraco-production-irsa-order-service` | Secrets Manager read, KMS decrypt |
+| `ai-service-sa` | `vastraco-production-irsa-ai-service` | Secrets Manager read, KMS decrypt |
+
+The frontend does not use IRSA — it has no AWS API dependencies.
+
+### 5.7 S3 (`modules/s3`)
+
+- Bucket: `vastraco-production-product-images` (name includes environment prefix)
+- SSE-KMS encryption with the CMK
+- Public access blocked; images served only through CloudFront via Origin Access Control (OAC)
+- Versioning enabled
+
+### 5.8 ALB (`modules/alb`)
+
+- Internet-facing Application Load Balancer in public subnets
+- HTTPS listener (port 443) with ACM certificate
+- HTTP listener (port 80) redirects to HTTPS
+- ALB security group allows 80/443 from `0.0.0.0/0`
+- An `aws_security_group_rule` opens all ports from the ALB SG to the EKS node SG for health checks and traffic forwarding
+
+### 5.9 CloudFront (`modules/cloudfront`)
+
+CloudFront sits in front of both the ALB (dynamic traffic) and S3 (static assets):
+
+| Cache Behavior | Origin | Protocols | Notes |
+|---|---|---|---|
+| `/api/*` | ALB | HTTPS-only | Forwards `Authorization`, `Origin`, cookies, query strings |
+| `/images/*` | S3 (OAC) | HTTPS-only | No query string forwarding, longer TTL |
+| `/*` (default) | ALB | Redirect HTTP → HTTPS | SPA routing (returns index.html) |
+
+- **Aliases:** `vastraco.online`, `www.vastraco.online`
+- **Price class:** PriceClass_100 (US, Canada, Europe)
+- **WAF:** Associated with the WAFv2 WebACL
+- **IPv6:** Enabled
+
+### 5.10 WAF (`modules/waf`)
+
+A WAFv2 WebACL (scope `CLOUDFRONT`, must be in `us-east-1`) with:
+
+- **AWSManagedRulesCommonRuleSet** — SQL injection, XSS, LFI protection
+- **AWSManagedRulesKnownBadInputsRuleSet** — Known bad request patterns
+- **AWSManagedRulesAmazonIpReputationList** — Block known malicious IPs
+- All rules with CloudWatch metrics and sampled request logging enabled
+
+### 5.11 Route53 (`modules/route53`)
+
+- Zone: `vastraco.online`
+- A record (alias) → CloudFront distribution
+- `www` CNAME → CloudFront distribution
+
+### 5.12 Monitoring (`modules/monitoring`)
+
+**CloudWatch Log Groups:**
+
+| Log Group | Retention |
+|---|---|
+| `/aws/eks/<cluster>/cluster` | 7 days |
+| `/vastraco/production/application` | 14 days |
+| `/aws/rds/instance/<id>/postgresql` | 7 days |
+
+All log groups are encrypted with the KMS CMK.
+
+**CloudWatch Alarms → SNS topic `vastraco-production-alerts` → email subscription:**
+
+| Alarm | Threshold | Periods |
+|---|---|---|
+| EKS node CPU high | >80% | 2 x 5 min |
+| RDS CPU high | >80% | 2 x 5 min |
+| RDS free storage low | <5 GB | 1 x 5 min |
+| ALB 5xx error rate high | >5% | 2 x 5 min |
+
+---
+
+## 6. Kubernetes & Helm
+
+### 6.1 Helm Chart (`charts/vastraco-services`)
+
+The chart uses a single `deployment.yaml` template that ranges over the `services` map in `values.yaml`, generating a Deployment, Service, HPA, ServiceAccount, ConfigMap, and SecretProviderClass for each service.
+
+**Per-service values structure:**
+
+```yaml
+services:
+  <name>:
+    enabled: true
+    image:
+      repository: 078426574503.dkr.ecr.us-east-1.amazonaws.com/<name>
+      tag: latest          # overridden in values-production.yaml by CI/CD
+      pullPolicy: IfNotPresent
+    replicaCount: 2
+    port: <port>
+    servicePort: <port>
+    irsa:
+      enabled: true
+      roleArn: ""          # set in values-production.yaml
+    serviceAccount:
+      create: true
+      name: <name>-sa      # must match IRSA trust policy
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits: { cpu: 300m, memory: 256Mi }
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 5
+      targetCPUUtilizationPercentage: 70
+    livenessProbe:
+      httpGet: { path: /health, port: <port> }
+    readinessProbe:
+      httpGet: { path: /ready, port: <port> }
+    configMap: {}           # non-secret env vars
+    secretProviderClass: <name>-secrets
+    env: []
+```
+
+**Pod security context (all services):**
+- `runAsNonRoot: true`, `runAsUser: 1000` (Node.js services)
+- `runAsNonRoot: false`, `runAsUser: 101` (frontend — nginx user)
+- `allowPrivilegeEscalation: false`
+- `capabilities: drop: [ALL]`
+
+### 6.2 Production Values (`values-production.yaml`)
+
+This file is the GitOps target. The CD pipeline updates it automatically on every successful CI run:
+
+```yaml
+global:
+  namespace: production
+  aws:
+    region: us-east-1
+    accountId: "078426574503"
+
+services:
+  frontend:
+    replicaCount: 2
+    image:
+      tag: <git-sha>           # ← updated by CD pipeline
+  user-service:
+    replicaCount: 2
+    image:
+      tag: <git-sha>
+    irsa:
+      enabled: true
+      roleArn: "arn:aws:iam::078426574503:role/vastraco-production-irsa-user-service"
+  # ... same pattern for product-service, order-service, ai-service
+```
+
+### 6.3 ArgoCD GitOps
+
+ArgoCD watches `VastraCo-AWS/vastraCo-helm` (branch `main`) and reconciles the `production` namespace continuously.
+
+**Application manifest (`argocd/application-production.yaml`):**
+
+```yaml
+spec:
+  source:
+    repoURL: https://github.com/VastraCo-AWS/vastraCo-helm
+    targetRevision: main
+    path: charts/vastraco-services
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-production.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true       # removes resources deleted from the chart
+      selfHeal: true    # reverts manual kubectl changes
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+**AppProject (`argocd/appproject.yaml`):**
+- Restricts source repos to `VastraCo-AWS/vastraCo-helm`
+- Restricts destination to the `production` namespace on the local cluster
+- Allows `Namespace` and `SecretProviderClass` as cluster-scoped resources
+
+---
+
+## 7. CI/CD Pipeline
+
+### 7.1 CI Workflow (`.github/workflows/ci.yml`)
+
+**Triggers:** Push to `main` or `develop`, any pull request, manual `workflow_dispatch` (with `force_all_services` flag).
+
+The pipeline uses `dorny/paths-filter` to detect which services changed. Only affected services run their CI stages. The `force_all_services` input bypasses this and runs all stages.
+
+**Per-service pipeline (runs in parallel across services):**
+
+```
+Stage 0: detect-changes (paths-filter)
+         │
+         ├── Stage 1: prepare / Unit Tests
+         │         └── Stage 2a: SonarCloud scan ──┐
+         │         └── Stage 2b: Snyk dep scan    ─┼──► Stage 3: Build + Push
+         │         └── Stage 2c: Trivy FS scan    ─┘
+         │                    │
+         │                    ▼
+         │         docker build → Trivy image scan → ECR push
+         │                    │
+         │                    ▼
+         │         Upload build-metadata artifact
+         │         {service_name, image_uri, image_tag (7-char SHA)}
+```
+
+**Quality Gates:**
+
+| Stage | Tool | Threshold | Failure behavior |
+|---|---|---|---|
+| Unit tests | npm test / pytest | Any failure | Blocks build |
+| SAST / code quality | SonarCloud | Quality gate (non-blocking by default) | `qualitygate.wait=false` |
+| Dependency scan | Snyk | HIGH or CRITICAL | Blocks build |
+| Filesystem scan | Trivy | CRITICAL (CRITICAL+HIGH for product/order) | Blocks build |
+| Container image scan | Trivy | CRITICAL, `ignore-unfixed: true` | Blocks build |
+
+**Docker images are tagged with the first 7 characters of `GITHUB_SHA`** (e.g., `164cb54`). The same SHA is used in the `build-metadata` artifact uploaded at the end of each service's pipeline.
+
+**ECR repositories:**
+- `078426574503.dkr.ecr.us-east-1.amazonaws.com/frontend-service`
+- `078426574503.dkr.ecr.us-east-1.amazonaws.com/user-service`
+- `078426574503.dkr.ecr.us-east-1.amazonaws.com/product-service`
+- `078426574503.dkr.ecr.us-east-1.amazonaws.com/order-service`
+- `078426574503.dkr.ecr.us-east-1.amazonaws.com/ai-service`
+
+### 7.2 CD Workflow (`.github/workflows/cd.yml`)
+
+**Triggers:** `workflow_run` on `VastraCo CI` with `conclusion == success`.
+
+**Steps:**
+
+1. **Download artifacts** — Uses `dawidd6/action-download-artifact@v6` to download all `build-metadata-*` artifacts from the triggering CI run. Each artifact contains a `metadata.json` with `{service_name, image_uri, image_tag}`.
+
+2. **Install yq v4** — Required for in-place YAML editing of the Helm values file.
+
+3. **Checkout Helm repo** — Clones `VastraCo-AWS/vastraCo-helm` using `HELM_REPO_PAT` (a PAT with write access to the Helm repo).
+
+4. **Update image tags** — For each `metadata.json` found:
+   - Maps service name to the yq path (e.g., `user-service` → `.services."user-service".image.tag`)
+   - Runs `yq e '<path> = "<tag>"' -i values-production.yaml`
+
+5. **Write Job Summary** — Posts a markdown table to the GitHub Actions step summary listing each updated service, tag, and values file path.
+
+6. **Commit and push** — Commits `values-production.yaml` to the Helm repo with the message `[GitOps] Update <service> image tag to <sha>`. ArgoCD detects the new commit within seconds and begins a sync.
+
+7. **Update kubeconfig** — Calls `aws eks update-kubeconfig` using the `EKS_CLUSTER_NAME` secret.
+
+8. **Wait for ArgoCD sync** — Sleeps 60 seconds to allow ArgoCD to detect the Helm repo change and begin syncing.
+
+9. **Verify rollout** — For each updated service, runs `kubectl rollout status deployment/<service> --namespace production --timeout=300s`.
+
+10. **Smoke tests** — Port-forwards each updated backend service and hits `GET /health`. Fails the workflow if any service returns non-200.
+
+11. **Email notification** — Sends a success or failure email via Gmail SMTP using `dawidd6/action-send-mail@v3`. The success email lists all pipeline stages that completed; the failure email lists common failure causes and a link to the workflow run.
+
+### 7.3 Required Secrets & Variables
+
+**Repository Secrets (vastraCo-app):**
+
+| Secret | Used By | Description |
+|---|---|---|
+| `AWS_ACCESS_KEY_ID` | CI, CD | AWS credentials for ECR login and EKS kubeconfig |
+| `AWS_SECRET_ACCESS_KEY` | CI, CD | AWS credentials |
+| `SNYK_TOKEN` | CI | Snyk authentication |
+| `SONAR_TOKEN` | CI | SonarCloud authentication |
+| `HELM_REPO_PAT` | CD | GitHub PAT with write access to vastraCo-helm |
+| `EKS_CLUSTER_NAME` | CD | EKS cluster name for kubeconfig |
+| `EMAIL_USERNAME` | CD | Gmail address for SMTP |
+| `EMAIL_PASSWORD` | CD | Gmail App Password |
+| `EMAIL_TO` | CD | Recipient email for notifications |
+
+**Repository Variables (vastraCo-app):**
+
+| Variable | Used By | Description |
+|---|---|---|
+| `SONAR_PROJECT_KEY` | CI | SonarCloud project key |
+| `SONAR_ORGANIZATION` | CI | SonarCloud organization slug |
+
+---
+
+## 8. Security
+
+### 8.1 Authentication & Authorization
+
+- JWT tokens signed with `HS256` and `JWT_SECRET` from AWS Secrets Manager.
+- Tokens are issued as HTTP-only cookies (`sameSite: lax`, `secure: true` in production, 7-day expiry).
+- The `authMiddleware` in each service verifies the JWT on protected routes.
+- The product service has an additional `requireAdmin` middleware that checks `role === 'admin'` from the JWT payload for write operations.
+- The AI service validates the JWT before granting access to order-query tools, preventing unauthenticated users from viewing order data.
+
+### 8.2 IRSA (Zero Static Credentials)
+
+No AWS access keys are stored inside pods. Each backend service runs with a Kubernetes ServiceAccount that is annotated with its IRSA role ARN. The EKS OIDC provider exchanges the ServiceAccount token for a temporary AWS credential scoped to the pod's role. Credentials are automatically rotated by the AWS SDK.
+
+### 8.3 Secrets Injection (CSI Driver)
+
+Secrets are injected into pods at mount time using the **AWS Secrets Store CSI Driver** with `SecretProviderClass` objects. The driver:
+1. Authenticates to Secrets Manager using the pod's IRSA role.
+2. Fetches the secret and writes it as a file in a tmpfs volume.
+3. Syncs the secret data into a Kubernetes `Secret` object.
+4. Kubernetes mounts the `Secret` as environment variables.
+
+Secrets never appear in the Helm chart or values files.
+
+### 8.4 Network Security
+
+- EKS nodes are in private subnets — no direct internet inbound.
+- ALB is the only internet-facing entry point.
+- CloudFront's WAF filters traffic before it reaches the ALB.
+- RDS accepts connections only from the EKS node security group (port 5432).
+- Internal service-to-service calls (order → product for stock management) go over the Kubernetes cluster network by hostname (`http://product-service:3002`). Network Policies in the Helm chart restrict cross-namespace traffic.
+- The frontend has no IRSA role and no AWS API access — it is a purely static nginx container.
+
+### 8.5 Container Security
+
+- All Node.js containers run as UID 1000 (`runAsNonRoot: true`).
+- The frontend nginx container runs as UID 101 (nginx user).
+- `allowPrivilegeEscalation: false` and `capabilities: drop: [ALL]` are set on all containers.
+- Trivy scans both the filesystem and the final container image during CI.
+- Snyk scans all dependencies (npm packages and Python requirements).
+
+### 8.6 WAF Protection
+
+The WAFv2 WebACL protects the CloudFront distribution with three AWS Managed Rule Groups:
+- **AWSManagedRulesCommonRuleSet:** Common web exploits (SQLi, XSS, size restrictions, LFI)
+- **AWSManagedRulesKnownBadInputsRuleSet:** Exploits targeting known CVEs and bad inputs
+- **AWSManagedRulesAmazonIpReputationList:** IPs associated with bots and threat actors
+
+All rules emit CloudWatch metrics for monitoring.
+
+---
+
+## 9. Local Development
+
+### Prerequisites
+
+- Docker Desktop (with Compose v2)
+- AWS CLI configured with credentials that have Secrets Manager and S3 access (for the local `.env` file)
+- Node.js 20+ (optional, for running services outside Docker)
+- Python 3.12+ (optional, for the AI service outside Docker)
+
+### Setup
+
+**1. Clone the repository:**
+```bash
+git clone https://github.com/VastraCo-AWS/vastraCo-app.git
+cd vastraCo-app
+```
+
+**2. Create `.env` from the example:**
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and fill in all values. See [Section 11](#11-environment-variables-reference) for the complete reference.
+
+**3. Start the stack:**
+```bash
+docker compose up -d --build
+```
+
+**4. Verify all containers are running:**
+```bash
+docker ps
+docker compose logs -f
+```
+
+The application is available at `http://localhost:3000`.
+
+### Service Health Checks
+
+All backend services expose `/health` and `/ready` endpoints. Docker Compose configures health checks on all three PostgreSQL containers so that services wait for their database before starting.
+
+```bash
+# Check user service health
+curl http://localhost:3001/health
+
+# Check AI service health (includes Groq connectivity)
+curl http://localhost:3004/api/ai/health
+```
+
+### Running Services Individually (without Docker)
+
+```bash
+# User service
+cd user-service && npm install && node src/server.js
+
+# Product service
+cd product-service && npm install && node src/server.js
+
+# Order service
+cd order-service && npm install && node src/server.js
+
+# AI service
+cd ai-service && pip install -r requirements.txt
+uvicorn src.main:app --host 0.0.0.0 --port 3004 --reload
+
+# Frontend
+cd frontend && npm install && npm run dev
+```
+
+---
+
+## 10. Production Deployment
+
+### Prerequisites
+
+- Terraform >= 1.9
+- AWS CLI with credentials for the target account
+- `kubectl` and `helm` installed
+- `gh` CLI authenticated
+
+### Step 1 — Bootstrap (one-time)
+
+Create the Terraform state bucket and DynamoDB lock table:
+
+```bash
+cd vastraCo-terraform/bootstrap
+terraform init
+terraform apply
+```
+
+Run the OIDC setup script to create the GitHub OIDC provider in AWS and set the required repository secrets:
+
+```bash
+chmod +x scripts/setup-aws-oidc.sh scripts/setup-github.sh
+./scripts/setup-aws-oidc.sh
+./scripts/setup-github.sh
+```
+
+### Step 2 — Terraform Apply
+
+```bash
+cd terraform
+terraform init
+terraform plan -var-file=terraform.tfvars
+terraform apply -var-file=terraform.tfvars
+```
+
+This creates the VPC, EKS cluster, RDS instance, KMS key, all IAM/IRSA roles, Secrets Manager secrets, S3 bucket, ALB, CloudFront distribution, WAF WebACL, Route53 records, and CloudWatch monitoring.
+
+### Step 3 — Configure kubectl
+
+```bash
+aws eks update-kubeconfig \
+  --region us-east-1 \
+  --name vastraco-production
+```
+
+### Step 4 — Install ArgoCD
+
+```bash
+kubectl create namespace argocd
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+```
+
+### Step 5 — Apply ArgoCD Manifests
+
+```bash
+# From the vastraCo-helm repo
+kubectl apply -f argocd/appproject.yaml
+kubectl apply -f argocd/application-production.yaml
+```
+
+ArgoCD will immediately begin syncing the Helm chart to the `production` namespace.
+
+### Step 6 — Initialize Databases
+
+```bash
+# Run the DB creation job (creates users_db, products_db, orders_db schemas)
+kubectl apply -f jobs/db-creation-job.yaml -n production
+kubectl wait --for=condition=complete job/db-creation -n production --timeout=120s
+```
+
+### Step 7 — Upload Product Images to S3
+
+```bash
+aws s3 cp ./images/ s3://vastraco-production-product-images/ --recursive
+```
+
+### Step 8 — Trigger First Deployment
+
+Push a commit to `main` in `vastraCo-app`. The CI pipeline will build and scan all services, push images to ECR, and the CD pipeline will update the Helm values and trigger ArgoCD sync.
+
+---
+
+## 11. Environment Variables Reference
+
+Copy `.env.example` to `.env` for local development. On EKS, all sensitive values are injected from AWS Secrets Manager via the CSI Driver; non-sensitive values come from ConfigMaps.
+
+| Variable | Local Default | EKS Source | Description |
+|---|---|---|---|
+| `JWT_SECRET` | (set manually) | `vastraco/jwt-secret` | JWT signing secret (min 32 chars) |
+| `USER_DB_HOST` | `users-db` | `vastraco/db-creds` | PostgreSQL host for user service |
+| `USER_DB_PORT` | `5432` | ConfigMap | PostgreSQL port |
+| `USER_DB_NAME` | `users_db` | ConfigMap | Database name for user service |
+| `USER_DB_USER` | `vastraco_user` | `vastraco/db-creds` | DB username for user service |
+| `USER_DB_PASSWORD` | (set manually) | `vastraco/db-creds` | DB password for user service |
+| `PRODUCT_DB_HOST` | `products-db` | `vastraco/db-creds` | PostgreSQL host for product service |
+| `PRODUCT_DB_PORT` | `5432` | ConfigMap | PostgreSQL port |
+| `PRODUCT_DB_NAME` | `products_db` | ConfigMap | Database name for product service |
+| `PRODUCT_DB_USER` | `vastraco_product` | `vastraco/db-creds` | DB username for product service |
+| `PRODUCT_DB_PASSWORD` | (set manually) | `vastraco/db-creds` | DB password for product service |
+| `ORDER_DB_HOST` | `orders-db` | `vastraco/db-creds` | PostgreSQL host for order service |
+| `ORDER_DB_PORT` | `5432` | ConfigMap | PostgreSQL port |
+| `ORDER_DB_NAME` | `orders_db` | ConfigMap | Database name for order service |
+| `ORDER_DB_USER` | `vastraco_order` | `vastraco/db-creds` | DB username for order service |
+| `ORDER_DB_PASSWORD` | (set manually) | `vastraco/db-creds` | DB password for order service |
+| `PRODUCT_SERVICE_URL` | `http://product-service:3002` | ConfigMap | Internal URL for product service |
+| `ORDER_SERVICE_URL` | `http://order-service:3003` | ConfigMap | Internal URL for order service |
+| `USER_SERVICE_URL` | `http://user-service:3001` | ConfigMap | Internal URL for user service |
+| `GROQ_API_KEY` | (set manually) | `vastraco/app-secrets` | Groq API key (from console.groq.com) |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | ConfigMap | Groq model ID |
+
+**Recommended Groq Models:**
+
+| Model | Context | Use Case |
+|---|---|---|
+| `llama-3.3-70b-versatile` | 131k tokens | Production (recommended) |
+| `llama-3.1-8b-instant` | 128k tokens | Low latency / cost optimization |
+| `meta-llama/llama-4-scout-17b-16e-instruct` | 10k tokens | Newest Meta model |
+
+---
+
+## Appendix — AWS Account Details
+
+| Resource | Value |
+|---|---|
+| AWS Account ID | `078426574503` |
+| Region | `us-east-1` |
+| ECR Registry | `078426574503.dkr.ecr.us-east-1.amazonaws.com` |
+| Domain | `vastraco.online` |
+| EKS Cluster | `vastraco-production` |
+| Kubernetes Namespace | `production` |
+| KMS Key Alias | `vastraco-kms-key` |
+| Secrets Manager prefix | `vastraco/` |
